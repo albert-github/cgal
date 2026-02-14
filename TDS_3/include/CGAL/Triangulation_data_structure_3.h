@@ -23,24 +23,36 @@
 
 #include <CGAL/basic.h>
 
-#include <utility>
-#include <map>
-#include <set>
-#include <vector>
-#include <stack>
+#include <array>
+#include <cstddef>
+#include <functional>
+#include <iostream>
+#include <istream>
 #include <limits>
+#include <ostream>
+#include <stack>
+#include <utility>
+#include <vector>
 
-#include <boost/unordered_set.hpp>
+#include <boost/container_hash/hash.hpp>
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
 #include <boost/iterator/function_output_iterator.hpp>
-#include <CGAL/utility.h>
-#include <CGAL/iterator.h>
-#include <CGAL/STL_Extension/internal/Has_member_visited.h>
+#include <boost/unordered_set.hpp>
+#include <boost/unordered/unordered_set_fwd.hpp>
 
-#include <CGAL/Unique_hash_map.h>
 #include <CGAL/assertions.h>
+#include <CGAL/config.h>
+#include <CGAL/Handle_hash_function.h>
+#include <CGAL/IO/io.h>
+#include <CGAL/Iterator_range.h>
+#include <CGAL/iterator.h>
+#include <CGAL/IO/io.h>
+#include <CGAL/STL_Extension/internal/Has_member_visited.h>
+#include <CGAL/tags.h>
 #include <CGAL/Triangulation_utils_3.h>
+#include <CGAL/Unique_hash_map.h>
+#include <CGAL/utility.h>
 
 #include <CGAL/Concurrent_compact_container.h>
 #include <CGAL/Compact_container.h>
@@ -3279,12 +3291,12 @@ typename Triangulation_data_structure_3<Vb,Cb,Ct>::Cell_handle
 Triangulation_data_structure_3<Vb,Cb,Ct>::
 remove_from_maximal_dimension_simplex(Vertex_handle v)
 {
+    const auto dim = static_cast<size_type>(dimension());
     CGAL_precondition(dimension() >= 1);
-    CGAL_precondition(degree(v) == (size_type) dimension() + 1);
-    CGAL_precondition(number_of_vertices() >
-                                    (size_type) dimension() + 1);
+    CGAL_precondition(degree(v) == dim + 1);
+    CGAL_precondition(number_of_vertices() > dim + 1);
 
-    if (number_of_vertices() == (size_type) dimension() + 2) {
+    if (number_of_vertices() == dim + 2) {
         remove_decrease_dimension(v);
         return Cell_handle();
     }
@@ -3623,9 +3635,14 @@ is_valid(bool verbose, int level ) const
           return false;
 
       // Euler relation
-      if ( cell_count - facet_count + edge_count - vertex_count != 0 ) {
-        if (verbose)
-            std::cerr << "Euler relation unsatisfied" << std::endl;
+      const auto euler_characteristic =
+          static_cast<difference_type>(cell_count - facet_count + edge_count - vertex_count);
+      if ( euler_characteristic != 0 ) {
+        if(verbose) {
+          std::cerr << "Euler relation unsatisfied\n"
+                    << "    cell_count - facet_count + edge_count - vertex_count = "
+                    << euler_characteristic<< std::endl;
+        }
         CGAL_assertion(false);
         return false;
       }
@@ -3749,11 +3766,26 @@ bool
 Triangulation_data_structure_3<Vb,Cb,Ct>::
 is_valid(Vertex_handle v, bool verbose, int level) const
 {
-  bool result = v->is_valid(verbose,level);
-  result = result && v->cell()->has_vertex(v);
+  bool v_is_valid = v->is_valid(verbose,level);
+  bool has_vertex = v->cell()->has_vertex(v);
+  bool v_is_vertex = vertices().is_used(v);
+  bool vertex_cell_is_cell = cells().is_used(v->cell());
+  bool result = v_is_valid && has_vertex && v_is_vertex && vertex_cell_is_cell;
   if ( ! result ) {
-    if ( verbose )
-      std::cerr << "invalid vertex" << std::endl;
+    if ( verbose ) {
+      std::cerr << "invalid vertex " << IO::oformat(v) << std::endl;
+      if(! v_is_valid)
+        std::cerr << "- vertex not valid" << std::endl;
+      if(! has_vertex)
+        std::cerr << "- vertex->cell() does not have vertex" << std::endl;
+      if(! v_is_vertex)
+        std::cerr << "- not a vertex of the TDS" << std::endl;
+      if(! vertex_cell_is_cell)
+        std::cerr << "- vertex->cell() is not a cell of the TDS" << std::endl;
+      if(!has_vertex || !vertex_cell_is_cell)
+        std::cerr << "vertex->cell(): "
+                  << IO::oformat(v->cell()) << std::endl;
+    }
     CGAL_assertion(false);
   }
   return result;
@@ -3766,6 +3798,12 @@ is_valid(Cell_handle c, bool verbose, int level) const
 {
     if ( ! c->is_valid(verbose, level) )
         return false;
+    if(cells().is_used(c) == false) {
+        if (verbose)
+            std::cerr << "invalid cell " << IO::oformat(c) << std::endl;
+        CGAL_assertion(false);
+        return false;
+    }
 
     switch (dimension()) {
     case -2:
@@ -3944,7 +3982,7 @@ is_valid(Cell_handle c, bool verbose, int level) const
       {
         int i;
         for(i = 0; i < 4; i++) {
-          if ( c->vertex(i) == Vertex_handle() ) {
+          if ( c->vertex(i) == Vertex_handle() || vertices().is_used(c->vertex(i)) == false ) {
             if (verbose)
                 std::cerr << "vertex " << i << " nullptr" << std::endl;
             CGAL_assertion(false);
@@ -3955,7 +3993,7 @@ is_valid(Cell_handle c, bool verbose, int level) const
 
         for(i = 0; i < 4; i++) {
           Cell_handle n = c->neighbor(i);
-          if ( n == Cell_handle() ) {
+          if ( n == Cell_handle() || cells().is_used(n) == false ) {
             if (verbose)
               std::cerr << "neighbor " << i << " nullptr" << std::endl;
             CGAL_assertion(false);

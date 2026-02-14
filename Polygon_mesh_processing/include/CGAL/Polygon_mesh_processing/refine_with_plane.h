@@ -21,12 +21,20 @@
 #include <CGAL/Polygon_mesh_processing/connected_components.h>
 #include <CGAL/Polygon_mesh_processing/border.h>
 #include <CGAL/Polygon_mesh_processing/internal/Corefinement/Self_intersection_exception.h>
+#include <CGAL/Polygon_mesh_processing/internal/clip_convex.h>
 #ifndef CGAL_PLANE_CLIP_DO_NOT_USE_BOX_INTERSECTION_D
 #include <CGAL/Polygon_mesh_processing/self_intersections.h>
 #endif
+#include <boost/mpl/has_xxx.hpp>
 
 namespace CGAL {
 namespace Polygon_mesh_processing {
+namespace internal {
+
+BOOST_MPL_HAS_XXX_TRAIT_NAMED_DEF(Has_member_Does_not_support_CDT2,
+                                  Does_not_support_CDT2,
+                                  false)
+} // internal namespace
 
 #ifndef DOXYGEN_RUNNING
 template <class PolygonMesh>
@@ -74,6 +82,8 @@ struct Orthogonal_cut_plane_traits
   using Plane_3 = std::pair<int, FT>;
   using Point_3 = typename Kernel::Point_3;
 
+  struct Does_not_support_CDT2{};
+
   struct Oriented_side_3
   {
     Oriented_side operator()(const Plane_3& plane, const Point_3& p)  const
@@ -102,6 +112,16 @@ struct Orthogonal_cut_plane_traits
     }
   };
 
+  struct Compute_squared_distance_3
+  {
+    FT operator()(const Plane_3& plane, const Point_3& p)
+    {
+      // Signed distance
+      FT sd = p[plane.first] - plane.second;
+      return sd*sd;
+    }
+  };
+
   Oriented_side_3 oriented_side_3_object() const
   {
     return Oriented_side_3();
@@ -110,6 +130,11 @@ struct Orthogonal_cut_plane_traits
   Construct_plane_line_intersection_point_3 construct_plane_line_intersection_point_3_object() const
   {
     return Construct_plane_line_intersection_point_3();
+  }
+
+  Compute_squared_distance_3 compute_squared_distance_3_object() const
+  {
+    return Compute_squared_distance_3();
   }
 
 #ifndef CGAL_PLANE_CLIP_DO_NOT_USE_BOX_INTERSECTION_D
@@ -170,6 +195,13 @@ struct Orthogonal_cut_plane_traits
  *      \cgalParamType{Boolean}
  *      \cgalParamDefault{`true`}
  *      \cgalParamExtra{The function `triangulate_faces()` can be used to triangule faces before calling this function.}
+ *    \cgalParamNEnd
+ *
+ *    \cgalParamNBegin{use_convex_specialization}
+ *      \cgalParamDescription{If set to `true`, a faster implementation specialized for convex meshes is used. The input mesh must be convex to guarantee a correct execution and results.}
+ *      \cgalParamType{Boolean}
+ *      \cgalParamDefault{`false`}
+ *      \cgalParamExtra{convex specialization is only used if `edge_is_constrained_map`, `edge_is_marked_map` and `vertex_oriented_side_map` are unused.}
  *    \cgalParamNEnd
  *
  *    \cgalParamNBegin{vertex_point_map}
@@ -246,6 +278,16 @@ void refine_with_plane(PolygonMesh& pm,
 
   auto ecm = choose_parameter<Default_ecm>(get_parameter(np, internal_np::edge_is_constrained));
   auto edge_is_marked = choose_parameter<Default_ecm>(get_parameter(np, internal_np::edge_is_marked_map));
+
+  bool use_convex_specialization = choose_parameter(get_parameter(np, internal_np::use_convex_specialization), false)
+                                   && is_default_parameter<NamedParameters, internal_np::edge_is_constrained_t>::value
+                                   && is_default_parameter<NamedParameters, internal_np::edge_is_marked_map_t>::value
+                                   && is_default_parameter<NamedParameters, internal_np::vertex_oriented_side_map_t>::value;
+  if(use_convex_specialization){
+    halfedge_descriptor he = internal::find_crossing_edge(pm, plane, np);
+    internal::refine_convex_with_plane(pm, plane, he, np);
+    return;
+  }
 
   Default_visitor default_visitor;
   Visitor_ref visitor = choose_parameter(get_parameter_reference(np, internal_np::visitor), default_visitor);
@@ -427,10 +469,16 @@ void refine_with_plane(PolygonMesh& pm,
     for (halfedge_descriptor h : halfedges_around_target(hv, pm))
     {
       if (is_border(h, pm)) continue;
+
+
       Oriented_side prev_ori = get(vertex_os, source(h, pm)),
                     next_ori = get(vertex_os, target(next(h, pm), pm));
-      if (prev_ori == ON_ORIENTED_BOUNDARY || next_ori == ON_ORIENTED_BOUNDARY) continue; // skip full edge
-      if (prev_ori!=next_ori) splitted_faces[face(h, pm)].push_back(h); // skip tangency point
+
+
+      splitted_faces[face(h, pm)].push_back(h);
+      // we insert tangency point twice as the vertex will be used twice to split a face (if not a crossing)
+      if (prev_ori==ON_ORIENTED_BOUNDARY || next_ori==ON_ORIENTED_BOUNDARY || prev_ori==next_ori)
+        splitted_faces[face(h, pm)].push_back(h); // skip crossing points
     }
   }
 
@@ -439,14 +487,27 @@ void refine_with_plane(PolygonMesh& pm,
   {
     std::size_t nb_hedges = f_and_hs.second.size();
 
-    CGAL_assertion( nb_hedges%2 ==0 );
+    // filter out faces that are included in the cutting plane (the cut line does not apply)
+    if (at_least_one_on && nb_hedges%2==0)
+    {
+      bool skip=true;
+      for (std::size_t i=0; i<nb_hedges; i+=2)
+        if(f_and_hs.second[i]!=f_and_hs.second[i+1])
+        {
+          skip=false;
+          break;
+        }
+      if (skip) continue;
+    }
 
     visitor.before_subface_creations(f_and_hs.first, pm);
 
     if (nb_hedges==2)
     {
       halfedge_descriptor h1=f_and_hs.second[0], h2=f_and_hs.second[1];
-      CGAL_assertion(next(h1,pm)!=h2 && next(h2,pm)!=h1); // the edge does not already exist
+      if(next(h1,pm)==h2 || next(h2,pm)==h1 || h1==h2) // the edge does not already exist
+        continue;
+
       visitor.before_subface_created(pm);
       halfedge_descriptor res = CGAL::Euler::split_face(h1, h2, pm);
       visitor.after_subface_created(face(h2, pm), pm);
@@ -482,7 +543,6 @@ void refine_with_plane(PolygonMesh& pm,
     else
     {
       // sort hedges to make them match
-      CGAL_assertion(!triangulate);
       // TODO: need mechanism to make it robust even with EPICK
       auto less_hedge = [&pm, vpm](halfedge_descriptor h1, halfedge_descriptor h2)
       {
@@ -490,12 +550,48 @@ void refine_with_plane(PolygonMesh& pm,
       };
       std::sort(f_and_hs.second.begin(), f_and_hs.second.end(), less_hedge);
 
+      // remove duplicated vertex at the beginning and at the end of the sorted list
+      // in case the next/prev edge is fully included (its the entry/exit point of the line
+      // and we don't need twice the vertex in that case)
+      if (f_and_hs.second[0]==f_and_hs.second[1])
+      {
+        halfedge_descriptor h = f_and_hs.second[0];
+        if ( get(vertex_os, source(h, pm))==ON_ORIENTED_BOUNDARY || get(vertex_os, target(next(h, pm), pm))==ON_ORIENTED_BOUNDARY)
+          f_and_hs.second.erase(f_and_hs.second.begin());
+      }
+      if (f_and_hs.second.back()==*std::prev(f_and_hs.second.end(),2))
+      {
+        halfedge_descriptor h = f_and_hs.second.back();
+        if ( get(vertex_os, source(h, pm))==ON_ORIENTED_BOUNDARY || get(vertex_os, target(next(h, pm), pm))==ON_ORIENTED_BOUNDARY)
+          f_and_hs.second.pop_back();
+      }
+
+
+      nb_hedges = f_and_hs.second.size();
+      CGAL_assertion(nb_hedges%2==0);
+      CGAL_assertion(!triangulate || nb_hedges==2);
+
       for (std::size_t i=0; i<nb_hedges; i+=2)
       {
-        halfedge_descriptor h1=f_and_hs.second[i], h2=f_and_hs.second[i+1];
-        CGAL_assertion(next(h1,pm)!=h2 && next(h2,pm)!=h1); // the edge does not already exist
+        halfedge_descriptor h1=f_and_hs.second[i],
+                            h2=f_and_hs.second[i+1],
+                            h3=i+2<nb_hedges?f_and_hs.second[i+2]:boost::graph_traits<PolygonMesh>::null_halfedge();
+
+        if(next(h1,pm)==h2 || next(h2,pm)==h1 || h1==h2) // the edge does not already exist or is an outer tangency
+          continue;
+
+        bool update_h3 = h2==h3;
+
         visitor.before_subface_created(pm);
         halfedge_descriptor res = CGAL::Euler::split_face(h1, h2, pm);
+
+        if (update_h3 && face(f_and_hs.second[i+3], pm)!=face(h3,pm))
+        {
+          CGAL_assertion(target(h3, pm)==target(res,pm));
+          CGAL_assertion(face(f_and_hs.second[i+3], pm)==face(res,pm));
+          f_and_hs.second[i+2]=res;
+        }
+
         if constexpr (has_visitor)
         {
           if (face(h1,pm)!=face(h2,pm))
@@ -508,6 +604,7 @@ void refine_with_plane(PolygonMesh& pm,
 
     visitor.after_subface_creations(pm);
   }
+  CGAL_assertion(is_valid_polygon_mesh(pm));
 }
 
 } } // CGAL::Polygon_mesh_processing
